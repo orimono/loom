@@ -22,7 +22,7 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	fmt.Println("针 (Hari) 已连接！等待 JoinPacket...")
+	fmt.Println("已连接！等待 JoinPacket...")
 
 	for {
 		// 读取消息
@@ -45,7 +45,7 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("已载任务数: %d\n", len(joinPkg.TaskManifest))
 
 		// 回复一个简单的确认（测试用）
-		response := map[string]string{"status": "accepted", "msg": "Musubi 已经感知到你"}
+		response := map[string]string{"status": "accepted", "msg": "Loom 已经感知到你"}
 		resBytes, _ := json.Marshal(response)
 		conn.WriteMessage(websocket.TextMessage, resBytes)
 	}
@@ -53,6 +53,6 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	http.HandleFunc("/ws", handleConnection)
-	fmt.Println("Musubi 测试服务器启动在 :8080/ws ...")
+	fmt.Println("Loom 测试服务器启动在 :8080/ws ...")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
