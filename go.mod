@@ -1,4 +1,4 @@
-module github.com/orimono/musubi
+module github.com/orimono/loom
 
 go 1.25.8
 
