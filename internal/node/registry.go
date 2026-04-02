@@ -2,6 +2,7 @@ package node
 
 import (
 	"sync"
+	"time"
 )
 
 type NodeRegistry struct {
@@ -11,5 +12,18 @@ type NodeRegistry struct {
 }
 
 func NewNodeRegistry(store NodeStore) *NodeRegistry {
-	return nil
+	return &NodeRegistry{
+		nodes: make(map[string]*Node),
+		store: store,
+	}
+}
+
+func (r *NodeRegistry) Register(n *Node) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	n.LastSeenAt = time.Now()
+	r.nodes[n.NodeID] = n
+
+	return r.store.Upsert(n)
 }

@@ -1,58 +1,95 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/gorilla/websocket"
-	"github.com/orimono/ito" // 确保你的 go.work 或 replace 已配置好
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/orimono/ito"
+	"github.com/orimono/loom/internal/node"
+	"github.com/orimono/loom/internal/store"
 )
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-func handleConnection(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("Upgrade error: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	fmt.Println("已连接！等待 JoinPacket...")
-
-	for {
-		// 读取消息
-		_, message, err := conn.ReadMessage()
+func makeWSHandler(registry *node.NodeRegistry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Printf("Read error: %v", err)
-			break
+			slog.Error("upgrade failed", "err", err)
+			return
+		}
+		defer conn.Close()
+
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			slog.Error("read failed", "err", err)
+			return
 		}
 
-		// 尝试用 Ito 协议解码
-		var joinPkg ito.JoinPacket
-		if err := json.Unmarshal(message, &joinPkg); err != nil {
-			log.Printf("解析 Ito 数据失败: %v", err)
-			continue
+		var pkt ito.JoinPacket
+		if err := json.Unmarshal(msg, &pkt); err != nil {
+			slog.Warn("invalid JoinPacket", "err", err)
+			return
 		}
 
-		// 打印纳管信息
-		fmt.Printf("成功识别节点 [%s]\n", joinPkg.NodeID)
-		fmt.Printf("主机名: %s, 架构: %s/%s\n", joinPkg.Hostname, joinPkg.OS, joinPkg.Arch)
-		fmt.Printf("已载任务数: %d\n", len(joinPkg.TaskManifest))
+		n := &node.Node{
+			JoinPacket: pkt,
+			Status:     node.Pending,
+		}
+		if err := registry.Register(n); err != nil {
+			slog.Error("register failed", "nodeID", pkt.NodeID, "err", err)
+			return
+		}
 
-		// 回复一个简单的确认（测试用）
-		response := map[string]string{"status": "accepted", "msg": "Loom 已经感知到你"}
-		resBytes, _ := json.Marshal(response)
-		conn.WriteMessage(websocket.TextMessage, resBytes)
+		slog.Info("node registered", "nodeID", pkt.NodeID, "hostname", pkt.Hostname, "os", pkt.OS, "arch", pkt.Arch)
+
+		resp, _ := json.Marshal(map[string]string{"status": "accepted"})
+		conn.WriteMessage(websocket.TextMessage, resp)
 	}
 }
 
 func main() {
-	http.HandleFunc("/ws", handleConnection)
-	fmt.Println("Loom 测试服务器启动在 :8080/ws ...")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		slog.Error("DATABASE_URL is not set")
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		slog.Error("failed to connect to postgres", "err", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	nodeStore := store.NewPostgresNodeStore(pool)
+	registry := node.NewNodeRegistry(nodeStore)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", makeWSHandler(registry))
+
+	srv := &http.Server{Addr: ":8080", Handler: mux}
+
+	go func() {
+		<-ctx.Done()
+		srv.Shutdown(context.Background())
+	}()
+
+	slog.Info("loom listening", "addr", ":8080")
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		slog.Error("server error", "err", err)
+		os.Exit(1)
+	}
 }
