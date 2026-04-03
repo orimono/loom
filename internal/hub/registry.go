@@ -10,7 +10,9 @@ type ConnRegistry struct {
 	connMap sync.Map
 }
 
-func NewConnRegistry() *ConnRegistry
+func NewConnRegistry() *ConnRegistry {
+	return &ConnRegistry{}
+}
 
 func (r *ConnRegistry) Register(nodeID string, conn *NodeConn) {
 	conn.onClose = func(nodeID string) {

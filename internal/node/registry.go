@@ -27,3 +27,14 @@ func (r *NodeRegistry) Register(n *Node) error {
 
 	return r.store.Upsert(n)
 }
+
+func (r *NodeRegistry) ListAll() []*Node {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	nodes := make([]*Node, 0, len(r.nodes))
+	for _, n := range r.nodes {
+		nodes = append(nodes, n)
+	}
+	return nodes
+}

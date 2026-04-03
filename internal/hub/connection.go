@@ -10,9 +10,9 @@ import (
 )
 
 type NodeCfg struct {
-	pingInterval time.Duration
-	pongTimeout  time.Duration
-	writeTimeout time.Duration
+	PingInterval time.Duration
+	PongTimeout  time.Duration
+	WriteTimeout time.Duration
 }
 
 type NodeConn struct {
@@ -23,11 +23,12 @@ type NodeConn struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	nodeCfg  NodeCfg
-	onClose  func(nodeID string)
-	wg       sync.WaitGroup
+	onClose   func(nodeID string)
+	onMessage func(data []byte)
+	wg        sync.WaitGroup
 }
 
-func NewNodeConn(nodeID string, tenantID string, conn *websocket.Conn) *NodeConn {
+func NewNodeConn(nodeID string, tenantID string, conn *websocket.Conn, cfg NodeCfg) *NodeConn {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &NodeConn{
 		nodeID:   nodeID,
@@ -36,7 +37,12 @@ func NewNodeConn(nodeID string, tenantID string, conn *websocket.Conn) *NodeConn
 		sendCh:   make(chan []byte, 256),
 		ctx:      ctx,
 		cancel:   cancel,
+		nodeCfg:  cfg,
 	}
+}
+
+func (c *NodeConn) OnMessage(fn func(data []byte)) {
+	c.onMessage = fn
 }
 
 func (c *NodeConn) start() {
@@ -51,7 +57,7 @@ func (c *NodeConn) readLoop() {
 	defer c.cancel()
 	defer c.onClose(c.nodeID)
 
-	c.conn.SetReadDeadline(time.Now().Add(c.nodeCfg.pongTimeout))
+	c.conn.SetReadDeadline(time.Now().Add(c.nodeCfg.PongTimeout))
 
 	for {
 		messageType, data, err := c.conn.ReadMessage()
@@ -62,7 +68,9 @@ func (c *NodeConn) readLoop() {
 			return
 		}
 		_ = messageType
-		_ = data
+		if c.onMessage != nil {
+			c.onMessage(data)
+		}
 	}
 }
 
@@ -77,7 +85,7 @@ func (c *NodeConn) writeLoop() {
 			if !ok {
 				return
 			}
-			c.conn.SetWriteDeadline(time.Now().Add(c.nodeCfg.writeTimeout))
+			c.conn.SetWriteDeadline(time.Now().Add(c.nodeCfg.WriteTimeout))
 			if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
 				slog.Error("write error", "nodeID", c.nodeID, "error", err)
 				c.cancel()
@@ -90,11 +98,11 @@ func (c *NodeConn) writeLoop() {
 func (c *NodeConn) heartbeatLoop() {
 	defer c.wg.Done()
 
-	ticker := time.NewTicker(c.nodeCfg.pingInterval)
+	ticker := time.NewTicker(c.nodeCfg.PingInterval)
 	defer ticker.Stop()
 
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(c.nodeCfg.pongTimeout))
+		c.conn.SetReadDeadline(time.Now().Add(c.nodeCfg.PongTimeout))
 		return nil
 	})
 
@@ -103,7 +111,7 @@ func (c *NodeConn) heartbeatLoop() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(c.nodeCfg.writeTimeout))
+			c.conn.SetWriteDeadline(time.Now().Add(c.nodeCfg.WriteTimeout))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				c.cancel()
 				return
