@@ -26,6 +26,8 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 type Config struct {
 	Addr         string   `json:"addr"`
 	DatabaseURL  string   `json:"database_url"`
+	NatsURL      string   `json:"nats_url"`
+	StreamName   string   `json:"stream_name"`
 	PingInterval Duration `json:"ping_interval"`
 	PongTimeout  Duration `json:"pong_timeout"`
 	WriteTimeout Duration `json:"write_timeout"`

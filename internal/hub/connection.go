@@ -45,6 +45,10 @@ func (c *NodeConn) OnMessage(fn func(data []byte)) {
 	c.onMessage = fn
 }
 
+func (c *NodeConn) Context() context.Context {
+	return c.ctx
+}
+
 func (c *NodeConn) start() {
 	c.wg.Add(3)
 	go c.readLoop()

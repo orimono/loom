@@ -1,0 +1,9 @@
+{
+  "addr": ":8080",
+  "database_url": "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable",
+  "nats_url": "nats://localhost:4222",
+  "stream_name": "TELEMETRY",
+  "ping_interval": "20s",
+  "pong_timeout": "60s",
+  "write_timeout": "5s"
+}

@@ -12,10 +12,12 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go"
 	"github.com/orimono/ito"
 	"github.com/orimono/loom/internal/api"
 	"github.com/orimono/loom/internal/config"
 	"github.com/orimono/loom/internal/hub"
+	loomjs "github.com/orimono/loom/internal/jetstream"
 	"github.com/orimono/loom/internal/node"
 	"github.com/orimono/loom/internal/store"
 	"github.com/orimono/loom/internal/telemetry"
@@ -25,7 +27,7 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-func makeWSHandler(nodeRegistry *node.NodeRegistry, connRegistry *hub.ConnRegistry, telHub *telemetry.Hub, nodeCfg hub.NodeCfg) http.HandlerFunc {
+func makeWSHandler(nodeRegistry *node.NodeRegistry, connRegistry *hub.ConnRegistry, telHub *telemetry.Hub, pub *loomjs.Publisher, nodeCfg hub.NodeCfg) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -69,6 +71,9 @@ func makeWSHandler(nodeRegistry *node.NodeRegistry, connRegistry *hub.ConnRegist
 				return
 			}
 			telHub.Publish(t)
+			if pub != nil {
+				pub.Publish(nodeConn.Context(), t)
+			}
 		})
 		connRegistry.Register(pkt.NodeID, nodeConn)
 	}
@@ -87,6 +92,32 @@ func main() {
 	}
 	defer pool.Close()
 
+	// JetStream publisher（可选，NATS 未配置时降级运行）
+	var pub *loomjs.Publisher
+	if cfg.NatsURL != "" {
+		nc, err := nats.Connect(cfg.NatsURL)
+		if err != nil {
+			slog.Warn("failed to connect to nats, running without persistence", "err", err)
+		} else {
+			defer nc.Drain()
+			streamName := cfg.StreamName
+			if streamName == "" {
+				streamName = "TELEMETRY"
+			}
+			p, err := loomjs.NewPublisher(nc, streamName)
+			if err != nil {
+				slog.Warn("failed to create jetstream publisher", "err", err)
+			} else {
+				if err := p.EnsureStream(ctx, "telemetry.>"); err != nil {
+					slog.Warn("failed to ensure stream", "err", err)
+				} else {
+					pub = p
+					slog.Info("jetstream publisher ready", "stream", streamName)
+				}
+			}
+		}
+	}
+
 	nodeCfg := hub.NodeCfg{
 		PingInterval: time.Duration(cfg.PingInterval),
 		PongTimeout:  time.Duration(cfg.PongTimeout),
@@ -97,11 +128,13 @@ func main() {
 	nodeRegistry := node.NewNodeRegistry(nodeStore)
 	connRegistry := hub.NewConnRegistry()
 	telHub := telemetry.NewHub()
+	telStore := store.NewTelemetryStore(pool)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", makeWSHandler(nodeRegistry, connRegistry, telHub, nodeCfg))
+	mux.HandleFunc("/ws", makeWSHandler(nodeRegistry, connRegistry, telHub, pub, nodeCfg))
 	mux.HandleFunc("/api/nodes", api.NodesHandler(nodeRegistry))
 	mux.HandleFunc("/api/stream", api.SSEHandler(telHub))
+	mux.HandleFunc("/api/history", api.HistoryHandler(telStore))
 
 	srv := &http.Server{Addr: cfg.Addr, Handler: mux}
 
