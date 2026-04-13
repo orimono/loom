@@ -21,3 +21,13 @@ type Node struct {
 	Status     Status
 	LastSeenAt time.Time
 }
+
+type NodeResponse struct {
+	NodeID     string   `json:"node_id"`
+	Hostname   string   `json:"hostname"`
+	OS         string   `json:"os"`
+	Arch       string   `json:"arch"`
+	Tags       []string `json:"tags"`
+	Status     Status   `json:"status"`
+	LastSeenAt string   `json:"last_seen_at"`
+}

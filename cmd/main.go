@@ -14,7 +14,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 	"github.com/orimono/ito"
-	"github.com/orimono/loom/internal/api"
 	"github.com/orimono/loom/internal/config"
 	"github.com/orimono/loom/internal/hub"
 	loomjs "github.com/orimono/loom/internal/jetstream"
@@ -27,7 +26,7 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-func makeWSHandler(nodeRegistry *node.NodeRegistry, connRegistry *hub.ConnRegistry, telHub *telemetry.Hub, pub *loomjs.Publisher, nodeCfg hub.NodeCfg) http.HandlerFunc {
+func makeWSHandler(nodeRegistry *node.NodeRegistry, connRegistry *hub.ConnRegistry, telHub *telemetry.Hub, pub *loomjs.Publisher, nc *nats.Conn, nodeCfg hub.NodeCfg) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -61,7 +60,7 @@ func makeWSHandler(nodeRegistry *node.NodeRegistry, connRegistry *hub.ConnRegist
 
 		slog.Info("node registered", "nodeID", pkt.NodeID, "hostname", pkt.Hostname)
 
-		resp, _ := json.Marshal(map[string]string{"status": "accepted"})
+		resp, _ := ito.Encode(ito.KindJoinAccepted, map[string]string{"status": "accepted"})
 		conn.WriteMessage(websocket.TextMessage, resp)
 
 		nodeConn := hub.NewNodeConn(pkt.NodeID, "", conn, nodeCfg)
@@ -74,9 +73,102 @@ func makeWSHandler(nodeRegistry *node.NodeRegistry, connRegistry *hub.ConnRegist
 			if pub != nil {
 				pub.Publish(nodeConn.Context(), t)
 			}
+			if nc != nil {
+				nc.Publish("orimono.live."+t.NodeID+"."+t.Type, data)
+			}
 		})
 		connRegistry.Register(pkt.NodeID, nodeConn)
 	}
+}
+
+// setupNATSRPC registers synchronous request/reply handlers so osa can query loom without HTTP.
+func setupNATSRPC(nc *nats.Conn, nodeRegistry *node.NodeRegistry, telStore *store.TelemetryStore, connRegistry *hub.ConnRegistry) {
+	nc.Subscribe("orimono.loom.nodes.list", func(msg *nats.Msg) {
+		nodes := nodeRegistry.ListAll()
+		resp := make([]node.NodeResponse, 0, len(nodes))
+		for _, n := range nodes {
+			resp = append(resp, node.NodeResponse{
+				NodeID:     n.NodeID,
+				Hostname:   n.Hostname,
+				OS:         n.OS,
+				Arch:       n.Arch,
+				Tags:       n.Tags,
+				Status:     n.Status,
+				LastSeenAt: n.LastSeenAt.Format("2006-01-02 15:04:05"),
+			})
+		}
+		data, _ := json.Marshal(resp)
+		msg.Respond(data)
+	})
+
+	nc.Subscribe("orimono.loom.history", func(msg *nats.Msg) {
+		var req struct {
+			NodeID string `json:"node_id"`
+			Type   string `json:"type"`
+			Limit  int    `json:"limit"`
+		}
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			msg.Respond([]byte(`{"error":"invalid request"}`))
+			return
+		}
+		if req.NodeID == "" || req.Type == "" {
+			msg.Respond([]byte(`{"error":"node_id and type required"}`))
+			return
+		}
+		if req.Limit <= 0 || req.Limit > 1440 {
+			req.Limit = 120
+		}
+		records, err := telStore.Query(context.Background(), req.NodeID, req.Type, req.Limit)
+		if err != nil {
+			msg.Respond([]byte(`{"error":"query failed"}`))
+			return
+		}
+		data, _ := json.Marshal(records)
+		msg.Respond(data)
+	})
+
+	// nc.Subscribe("orimono.loom.executors", func(msg *nats.Msg) {
+	// 	var req struct {
+	// 		NodeID string `json:"node_id"`
+	// 	}
+
+	// 	if err := json.Unmarshal(msg.Data, &req); err != nil {
+	// 		msg.Respond([]byte(`{"error":"invalid request"}`))
+	// 		return
+	// 	}
+
+	// 	if req.NodeID == "" {
+	// 		msg.Respond([]byte(`{"error":"node_id and type required"}`))
+	// 		return
+	// 	}
+	// })
+
+	nc.Subscribe("orimono.loom.executor.register", func(msg *nats.Msg) {
+		var req struct {
+			NodeID   string                   `json:"node_id"`
+			Executor ito.ExecutorRegistration `json:"executor"`
+		}
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			msg.Respond([]byte(`{"error":"invalid request"}`))
+			return
+		}
+		if req.NodeID == "" {
+			msg.Respond([]byte(`{"error":"node_id required"}`))
+			return
+		}
+		data, err := ito.Encode(ito.KindExecutorRegister, req.Executor)
+		if err != nil {
+			msg.Respond([]byte(`{"error":"encode failed"}`))
+			return
+		}
+		if err := connRegistry.Send(req.NodeID, data); err != nil {
+			msg.Respond([]byte(`{"error":"` + err.Error() + `"}`))
+			return
+		}
+		msg.Respond([]byte(`{"ok":true}`))
+	})
+
+	slog.Info("nats rpc handlers registered")
 }
 
 func main() {
@@ -92,12 +184,13 @@ func main() {
 	}
 	defer pool.Close()
 
-	// JetStream publisher（可选，NATS 未配置时降级运行）
+	var nc *nats.Conn
 	var pub *loomjs.Publisher
+
 	if cfg.NatsURL != "" {
-		nc, err := nats.Connect(cfg.NatsURL)
+		nc, err = nats.Connect(cfg.NatsURL)
 		if err != nil {
-			slog.Warn("failed to connect to nats, running without persistence", "err", err)
+			slog.Warn("failed to connect to nats, running without nats", "err", err)
 		} else {
 			defer nc.Drain()
 			streamName := cfg.StreamName
@@ -130,11 +223,12 @@ func main() {
 	telHub := telemetry.NewHub()
 	telStore := store.NewTelemetryStore(pool)
 
+	if nc != nil {
+		setupNATSRPC(nc, nodeRegistry, telStore, connRegistry)
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", makeWSHandler(nodeRegistry, connRegistry, telHub, pub, nodeCfg))
-	mux.HandleFunc("/api/nodes", api.NodesHandler(nodeRegistry))
-	mux.HandleFunc("/api/stream", api.SSEHandler(telHub))
-	mux.HandleFunc("/api/history", api.HistoryHandler(telStore))
+	mux.HandleFunc("/ws", makeWSHandler(nodeRegistry, connRegistry, telHub, pub, nc, nodeCfg))
 
 	srv := &http.Server{Addr: cfg.Addr, Handler: mux}
 
